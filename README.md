@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Student Portal - Full Stack Web Application
 
 A comprehensive student management system built with FastAPI (backend) and React (frontend) featuring role-based access control for students, teachers, and administrators.
@@ -146,3 +147,4 @@ This project is licensed under the MIT License.
 ## 📞 Support
 
 For support and questions, please open an issue on GitHub.
+
