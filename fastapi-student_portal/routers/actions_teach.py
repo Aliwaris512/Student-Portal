@@ -1,0 +1,267 @@
+from fastapi import APIRouter, HTTPException, status, Depends
+from sqlalchemy.orm import Session
+from schema import teacher_schema
+from models import model
+from authentication.oauth2 import create_access_token, get_current_user
+from database.structure import get_db, engine
+from typing import List
+import datetime
+from websockets_router.login_websocket import active_connections
+import asyncio
+import redis
+import json
+import threading
+import asyncio
+
+
+
+router = APIRouter(
+    prefix="/api/v1/teacher",
+    tags=["For Faculty"]
+)
+
+@router.get('/courses')
+def get_teacher_courses(db: Session = Depends(get_db), current_teacher: model.Users = Depends(get_current_user())):
+    if current_teacher.role != "teacher":
+        raise HTTPException(status_code=403, detail="Only teachers can view their courses.")
+    courses = db.query(model.Courses).filter(model.Courses.instructor == current_teacher.name).all()
+    return [{
+        "id": c.id,
+        "course_name": c.course_name,
+        "credit_hrs": c.credit_hrs,
+        "fee": c.fee
+    } for c in courses]
+
+# ATTENDANCE:
+@router.post('/student/attendance/{student_id}')
+async def student_attendance(student_id: int,
+    teacher: teacher_schema.AttendanceInput,
+    db: Session = Depends(get_db),
+    current_teacher: model.Users = Depends(get_current_user())
+):
+    # Logic to mark attendance for a student
+    email = None
+    course = None
+    db_course = db.query(model.Enrollment).filter(model.Enrollment.student_id == student_id,model.Enrollment.course == teacher.course).first()
+    if not db_course:
+         raise HTTPException(
+             status_code=status.HTTP_404_NOT_FOUND,
+            detail="Student not enrolled in this course")
+           
+    mark_attendance = model.Attendance( student_id=student_id, student_name= teacher.student_name ,course=teacher.course, 
+    date=teacher.attendance_date, present=teacher.present)
+    course = mark_attendance.course
+    db.add(mark_attendance)
+    db.commit()
+    db.refresh(mark_attendance)
+    
+#Websocket logic
+    if current_teacher.email in active_connections:
+        asyncio.create_task(
+            send_notification(
+                current_teacher.email,
+                "Attendance marked successfully"
+            )
+        )
+    student = db.query(model.Users).filter(model.Users.id == student_id).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")    
+    email = student.email
+    #stu_notifications.delay(student.email, "Your attendance has been posted")
+    
+            
+# Publish login event to Redis
+ 
+    db.add(model.Notifications(email = email, message= f"Your {course} attendance has been posted"))
+    db.commit()
+    
+    r = redis.Redis(host='localhost', port=6379, db=0)
+    r.publish('notifications', json.dumps({"email" : email, 
+    "message" : f"Your {course} attendance has been posted"}))
+    
+    
+    return {"message": "Attendance marked successfully"}
+
+async   def send_notification(email:str, message:str):
+    #print(f"Sending notification to {email}: {message}")
+    if email in active_connections:
+        await active_connections[email].send_json({
+            "type": "event_created",
+            "message": message
+        }) 
+
+
+# GRADES:
+@router.post('/student/grades/{student_id}')
+async def student_grades(student_id: int,st_course: str,
+    teacher: teacher_schema.GradeInput,
+    db: Session = Depends(get_db),
+    current_teacher: model.Users = Depends(get_current_user())
+):
+    email = None
+    # Logic to add grades for a student
+    db_student = db.query(model.Enrollment).filter(model.Enrollment.student_id == student_id, model.Enrollment.course == st_course).first()
+    if not db_student:
+            raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Student not enrolled in this course"
+        )
+       
+    total_obtained = teacher.quiz + teacher.assignment + teacher.midterm + teacher.finalterm
+    total_possible = teacher.total_quiz + teacher.total_assignment + teacher.total_midterm + teacher.final_total
+
+    final_grade = (total_obtained / total_possible) * 100
+    if final_grade >= 90:
+        grade = "A"
+    elif final_grade >= 80:
+        grade = "B"
+    elif final_grade >= 70:
+       grade = "C"
+    elif final_grade >= 60:
+      grade = "D"
+    else:
+       grade = "F"    
+
+    new_grade = model.Grade(
+    student_id=student_id,
+    student_name=teacher.student_name,
+    course=st_course,
+    quiz=teacher.quiz,
+    total_quizmarks=teacher.total_quiz,
+    assignment=teacher.assignment,
+    total_assignmentmarks=teacher.total_assignment,
+    midterm=teacher.midterm,
+    total_midterm=teacher.total_midterm,
+    finalterm=teacher.finalterm,
+    final_total=teacher.final_total,
+    grade=grade)
+    
+    db.add(new_grade)
+    db.commit()
+    db.refresh(new_grade)
+
+# Websocket logic
+    
+    if current_teacher.email in active_connections:
+        asyncio.create_task(
+            send_notification(
+                current_teacher.email,
+                "Grades uploaded successfully"
+            )
+        )
+    student = db.query(model.Users).filter(model.Users.id == student_id).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")    
+    email = student.email    
+    
+    db.add(model.Notifications(email = email, message= f"Your {st_course} grades have been posted"))
+    db.commit()
+ 
+# Redis logic
+    
+    r = redis.Redis(host='localhost', port=6379, db=0)
+    r.publish('notifications', json.dumps({"email" : email, 
+    "message" : f"Your {st_course} grades have been posted"}))
+
+    return {"message": "Grades added successfully"}
+
+async  def send_notification(email:str, message:str):
+    #print(f"Sending notification to {email}: {message}")
+    if email in active_connections:
+        await active_connections[email].send_json({
+            "type": "grades_posted",
+            "message": message
+        }) 
+
+# For posting assignments
+
+@router.post('/student/tasks/{course_id}')
+async def upload_tasks(course_id: int,
+    task: teacher_schema.UploadTask,
+    db: Session = Depends(get_db),
+    current_teacher: model.Users = Depends(get_current_user())
+):
+    email = None
+    
+    db_course = db.query(model.Courses).filter(model.Courses.id == course_id).first()
+    course = db_course.course_name
+    if not db_course:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Course not found"
+        )
+    upload_date = datetime.date.today()
+    new_task = model.Tasks(
+        task_name=task.task_name,
+        upload_date=upload_date,
+        due_date=task.due_date,
+        course_id=course_id
+    )
+    
+    db.add(new_task)
+    db.commit()
+    db.refresh(new_task)
+    
+# Websocket logic    
+    if current_teacher.email in active_connections:
+        asyncio.create_task(
+            send_notification(
+                current_teacher.email,
+                "Task uploaded successfully"
+            )
+        )
+    students = db.query(model.Users).join(model.Enrollment,
+    model.Enrollment.student_id == model.Users.id).filter(model.Enrollment.course_id == course_id).all()
+    if not students:
+        raise HTTPException(status_code=404, detail="Student not found")    
+    email = [student.email for student in students]      
+
+# Redis logic
+  
+    r = redis.Redis(host='localhost', port=6379, db=0)
+    
+    for st_email in email:
+     db.add(model.Notifications(email = st_email, message= f"Your {course} grades have been posted"))
+     db.commit()          
+     r.publish('notifications', json.dumps({"email" : st_email, 
+    "message" : f"An {course} task has been posted"}))
+
+    return {"message": "Task uploaded successfully", "task": new_task}
+
+async   def send_notification(email:str, message:str):
+    #print(f"Sending notification to {email}: {message}")
+    if email in active_connections:
+        await active_connections[email].send_json({
+            "type": "task_posted",
+            "message": message
+        }) 
+
+# NEW: Teacher view all tasks/assignments they have posted
+@router.get('/student/tasks')
+def get_teacher_tasks(db: Session = Depends(get_db), current_teacher: model.Users = Depends(get_current_user())):
+    if current_teacher.role != "teacher":
+        raise HTTPException(status_code=403, detail="Only teachers can view their assignments.")
+    # Get all courses taught by this teacher
+    courses = db.query(model.Courses).filter(model.Courses.instructor == current_teacher.name).all()
+    course_ids = [c.id for c in courses]
+    # Get all tasks for these courses
+    tasks = db.query(model.Tasks).filter(model.Tasks.course_id.in_(course_ids)).all()
+    return [
+        {
+            "id": t.id,
+            "title": t.task_name,
+            "course_id": t.course_id,
+            "due_date": str(t.due_date),
+            "upload_date": str(t.upload_date),
+            "description": t.task_description if hasattr(t, 'task_description') else ""
+        }
+        for t in tasks
+    ]
+
+async   def send_notification(email:str, message:str):
+    #print(f"Sending notification to {email}: {message}")
+    if email in active_connections:
+        await active_connections[email].send_json({
+            "type": "task_posted",
+            "message": message
+        }) 
